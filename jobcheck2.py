@@ -477,6 +477,17 @@ class Fjob_list:
                 ss+=job.folder+'\n'
         return ss
 
+    def info_running_jobs(self):
+        # I don't need do anything here
+        ss=''
+        for job in self.fjobs:
+            if job.status=='r':
+                ss+=job.folder+'\n'
+                m=re.search(r'(Running time.*)',job.message)
+                if m:
+                    ss+=m.group()+'\n'+'--------\n'
+        return ss 
+
     def info_funny_jobs(self):
         # display detailed info here
         ss=''
@@ -510,7 +521,7 @@ def main(path):
     os.chdir(path)
     print(' ')
 
-    ss=fjobs.info_normal_jobs('r')
+    ss=fjobs.info_running_jobs()
     if ss:
         print(character_frame('Running jobs'))
         print(ss)
