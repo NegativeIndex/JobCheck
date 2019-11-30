@@ -1,4 +1,4 @@
-#!/Users/wdai11/anaconda3/bin/python3
+#!/usr/bin/env python
 
 import sys
 import subprocess
@@ -7,9 +7,48 @@ import re
 import os,glob,time
 import random
 from apscheduler.schedulers.blocking import BlockingScheduler
-   
-sys.path.insert(0,'/Users/wdai11/function')
-import my_output as my
+
+##################################################
+# help funciton
+##################################################
+def nice_sec2str(x):
+    """ Convert the number of seconds into a nice string
+
+    Args:
+        x (double): The number of seconds
+
+    Returns:
+        string: a nice time string
+
+    """
+    sec=datetime.timedelta(seconds=x)
+    d = datetime.datetime(1,1,1) + sec
+    unit=["days","hours","minutes","seconds"]
+    if d.day<3:
+        unit[0]="day"
+    if d.hour<2:
+        unit[1]="hour"
+    if d.minute<2:
+        unit[2]="minute"
+    if d.second<2:
+        unit[3]="second"
+
+    if (d.day>1):
+        ss="{:d} {} {:d} {} {:d} {} {:d} {} ".format(
+            d.day-1,unit[0],d.hour,unit[1], 
+            d.minute,unit[2], d.second,unit[3])
+    elif (d.hour>0):
+        ss="{:d} {} {:d} {} {:d} {} ".format(
+            d.hour,unit[1], 
+            d.minute,unit[2], d.second,unit[3])
+    elif (d.minute>0):
+        ss="{:d} {} {:d} {} ".format(
+            d.minute,unit[2], d.second,unit[3])
+    else:
+       ss="{:d} {} ".format(d.second,unit[3])
+ 
+    return ss
+
 
 ##################################################
 # collect information from job files
@@ -25,6 +64,7 @@ def jobid_from_begin_file(path='./'):
             m=re.search(r'Your job (\d+)',line)
             if m:
                 idxes.append(m.group(1))
+    
     return idxes
     
 
@@ -46,7 +86,7 @@ def jobid_from_done_file(path='./'):
 def is_finished_from_job_file(path='./'):
     idx1=jobid_from_begin_file(path)
     idx2=jobid_from_done_file(path)
-    if idx1 and idx2 and idx1[-1]==idx2[-1]:
+    if idx1 and idx2 and idx1[-1] in idx2:
         return True
     else:
         return False
@@ -105,7 +145,7 @@ def read_job_info(idx,path='./'):
 ###################################################
 def kill_job(idx):
     comm=["qdel",idx]
-    res = subprocess.check_output(comm)
+    res = subprocess.check_output(comm).decode("utf-8").rstrip()
     print("Killing message: "+res)
     time.sleep(3)
 
@@ -131,6 +171,23 @@ def submit_job(server="all.q",smp=None,path='./'):
         with open("job.begin", "a+") as f:
             f.write(line)
     os.chdir(cwd)
+
+####################################
+def submit_job_based_Q(q=None,path='./'):
+    cwd = os.getcwd()
+    os.chdir(path) 
+    files= glob.glob("dwt*.job")
+    for fname in  files:
+        if q:
+            server=q.available_server()
+            if server:
+                comm1=["-q", server]
+                res=subprocess.check_output(["qsub"]+comm1+[fname])
+                line=res.decode("utf-8")
+                print(line)
+                with open("job.begin", "a+") as f:
+                    f.write(line)
+    os.chdir(cwd)    
 
 ##################################################
 # help function
@@ -166,9 +223,26 @@ class Qjob:
             self.slots)
         return  ss     
 
+    # update the folder of a job based on idx
+    def get_folder(self):
+        idx=self.idx
+        try:
+            res = subprocess.check_output(['qstat','-j',idx])
+            match=re.search(r'sge_o_workdir:\s+(\S+)\s+',
+                            res.decode("utf-8"))
+            if match:
+                self.folder=match.group(1)
+            else:
+                self.folder=None
+        except subprocess.CalledProcessError as e:
+            self.folder=None
+
+
 class Qjob_list:
     def __init__(self):
         self.qjobs=[]
+        self.servers={'UI':0, 'INFORMATICS':0, 'all.q':0}
+        self.servers_max={'UI':0, 'INFORMATICS':0,'all.q':10000}
 
         
     def __str__(self):
@@ -204,7 +278,9 @@ class Qjob_list:
     # find a job based on the folder
     def find_base_folder(self,folder):
         jobs_list=[job for job in self.qjobs if \
-                   os.path.abspath(job.folder)==os.path.abspath(folder)]
+                   job.folder is not None and \
+                   os.path.abspath(job.folder)==os.path.abspath(folder) and \
+                   job.status!='dr']
         return jobs_list
 
     # how many UI used    
@@ -214,6 +290,14 @@ class Qjob_list:
             if job.server=="UI":
                 n+=1
         return n
+
+    # update number of jobs on each server
+    def update_servers(self):
+        for job in self.qjobs:
+            try:
+                self.servers[job.server]+=1
+            except KeyError:
+                self.servers['all.q']+=1
 
     # how many jobs submitted
     def n_jobs(self):
@@ -227,36 +311,93 @@ class Qjob_list:
                 n+=1
         return n
 
+    # available server for submit
+    def available_server(self):
+        for server,number in self.servers.items():
+            if number<self.servers_max[server]:
+                self.servers[server]+=1
+                return server
+        return None
+
     # update itself based on myq results
     def myq(self):
-        res = subprocess.check_output("myq")
+        res=subprocess.check_output("myq").decode("utf-8")
         lines=res.splitlines()
+        if not lines:
+            return 
+        line0=lines[0]
         del lines[0:2]
 
-        for ll in lines:
-            line=ll.decode("utf-8")
-            words=line.split()
-            idx=words[0]
-            status=words[4]
-            btime_str=words[5]+" "+words[6]
-            queue=words[7]
-            slots=words[8]
+        vars=('job-ID','prior','name','user','state', 
+              'submit/start at','queue', 'slots ja-task-ID')
+        bnd=[re.search(var,line0).start(0) for var in vars]
+        bnd.append(0)
+        dict={'idx':0,'status':4,'btime':5,'queue':6,'slots':7}
+
+        for line in lines:
+            bnd[-1]=len(line)
+            n=dict['idx']
+            idx=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+            n=dict['status']
+            status=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+            n=dict['btime']
+            btime_str=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+            n=dict['queue']
+            queue=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+            n=dict['slots']
+            slots=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+
             btime=datetime.datetime.strptime(btime_str, "%m/%d/%Y %H:%M:%S")
-            
             matchObj = re.match( r'(.*)@', queue, re.M|re.I)
             if matchObj:
                 server=matchObj.group(1)
             else:
                 server="all.q"
             # get folder
-            res = subprocess.check_output(['qstat','-j',idx])
-            match=re.search(r'sge_o_workdir:\s+(\S+)\s+',res.decode("utf-8"))
-            if match:
-                folder=match.group(1)
-            else:
-                folder=None
-            qjob=Qjob(idx,status,btime,server,slots,folder)
+            qjob=Qjob(idx,status,btime,server,slots,folder=None)
+            qjob.get_folder()
             self.append(qjob)
+
+    def myq_without_folder(self):
+        res=subprocess.check_output("myq").decode("utf-8")
+        lines=res.splitlines()
+        if not lines:
+            return 
+        line0=lines[0]
+        del lines[0:2]
+
+        vars=('job-ID','prior','name','user','state', 
+              'submit/start at','queue', 'slots ja-task-ID')
+        bnd=[re.search(var,line0).start(0) for var in vars]
+        bnd.append(0)
+        dict={'idx':0,'status':4,'btime':5,'queue':6,'slots':7}
+
+        for line in lines:
+            bnd[-1]=len(line)
+            n=dict['idx']
+            idx=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+            n=dict['status']
+            status=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+            n=dict['btime']
+            btime_str=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+            n=dict['queue']
+            queue=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+            n=dict['slots']
+            slots=line[bnd[n]:bnd[n+1]].rstrip().lstrip()
+
+            btime=datetime.datetime.strptime(btime_str, "%m/%d/%Y %H:%M:%S")
+            matchObj = re.match( r'(.*)@', queue, re.M|re.I)
+            if matchObj:
+                server=matchObj.group(1)
+            else:
+                server="all.q"
+            
+            qjob=Qjob(idx,status,btime,server,slots,folder=None)
+            self.append(qjob)
+
+    def get_folders(self):
+       for job in self.qjobs:
+            job.get_folder()
 
 
 ##########################################
@@ -285,12 +426,16 @@ class Fjob:
         status='d'
         idx=job_done_id(path)
         info=read_job_info(idx,path)
-        btime=info[1]
-        etime=info[2]
-        dtime=etime-btime
-        dtime_str=my.nice_sec2str(dtime.total_seconds())
-        ss1="Done"
-        ss2="Simulation time "+dtime_str
+        if len(info)>2:
+            btime=info[1]
+            etime=info[2]
+            dtime=etime-btime
+            dtime_str=nice_sec2str(dtime.total_seconds())
+            ss1="Done"
+            ss2="Simulation time "+dtime_str
+        else:
+            ss1="Done"
+            ss2="Simulation time unknown"
         message=ss1+"\n"+ss2
         return Fjob(path,status,message)
 
@@ -315,7 +460,7 @@ class Fjob:
 
         ctime_str=datetime.datetime.strftime(ctime,
                                     "%m/%d/%Y %H:%M:%S")
-        dtime_str=my.nice_sec2str(dtime.total_seconds())
+        dtime_str=nice_sec2str(dtime.total_seconds())
         ss1="Running     "+idx
         ss2="Checked at "+ctime_str
         ss3="Running time: "+dtime_str
@@ -332,7 +477,10 @@ class Fjob:
 
         ctime_str=datetime.datetime.strftime(ctime,
                                  "%m/%d/%Y %H:%M:%S")
-        dtime_str=my.nice_sec2str(dtime.total_seconds())
+        dtime_str=nice_sec2str(dtime.total_seconds())
+        if dtime.total_seconds()>3600:
+            ss1="Waiting and kill   "+idx
+
         ss2="Checked at "+ctime_str
         ss3="Waiting time: "+dtime_str
         message=ss1+"\n"+ss2+"\n"+ss3
@@ -416,26 +564,29 @@ class Fjob_list:
             os.chdir(folder)
             # a working folder is a folder with job.begin
             if os.path.isfile('job.begin'):
-                print('---------------------')
-                print(folder)
                 qjobs_folder=qjobs.find_base_folder(folder)
                 if len(qjobs_folder)==0:
-                    #no standing job, either done or not finished
+                    # no standing job, either done or not finished
                     if is_finished_from_job_file(folder):
                         fjob=Fjob.create_done_job(folder)
-                        print(fjob.message)
+                        # print(fjob.message)
                     else:
+                        print('---------------------')
+                        print(folder)
                         fjob=Fjob.create_not_done_job(folder)
                         print(fjob.message)
                         # Action: resubmit
-                        if nUI<2:
-                            submit_job(server="UI")
-                            nUI=nUI+1
-                        else:
-                            submit_job(server="all.q")
+                        submit_job_based_Q(q=qjobs,path='./')
+                        # if nUI<5:
+                        #     submit_job(server="UI")
+                        #     nUI=nUI+1
+                        # else:
+                        #     submit_job(server="all.q")
                         
                         
                 elif len(qjobs_folder)==1:
+                    print('---------------------')
+                    print(folder)
                     #one job, it is good
                     qjob=qjobs_folder[0]
                     status=qjob.status
@@ -446,21 +597,32 @@ class Fjob_list:
                     elif status=="qw":
                         fjob=Fjob.create_wait_job(qjob,folder)
                         print(fjob.message)
+                        if re.search('kill',fjob.message, re.M|re.I):
+                            kill_job(qjob.idx)
+                            submit_job_based_Q(q=qjobs,path='./')
+                            # if nUI<2:
+                            #     submit_job(server="UI")
+                            #     nUI=nUI+1
+                            # else:
+                            #     submit_job(server="all.q")
                     elif status=="Eqw":
                         fjob=Fjob.create_error_job(qjob,folder)
                         print(fjob.message)
                         # Action: kill it and resubmit
                         kill_job(qjob.idx)
-                        if nUI<2:
-                            submit_job(server="UI")
-                            nUI=nUI+1
-                        else:
-                            submit_job(server="all.q")
+                        submit_job_based_Q(q=qjobs,path='./')
+                        # if nUI<2:
+                        #     submit_job(server="UI")
+                        #     nUI=nUI+1
+                        # else:
+                        #     submit_job(server="all.q")
                     else:
                         fjob=Fjob.create_unknown_job(qjob,folder)
                         print(fjob.message)
                 else:
                     # more than one job, report it
+                    print('---------------------')
+                    print(folder)
                     fjob=Fjob.create_plural_job(qjobs_folder,folder)
                     print(fjob.message)
                     
@@ -504,12 +666,17 @@ def main(path):
     print(character_frame('My queue information'))
     qjobs=Qjob_list()
     qjobs.myq()
+    qjobs.update_servers()
     print(qjobs.short_str())
-    print('-'*50)
-    print(qjobs)
+    # print('-'*50)
+    # print(qjobs)
 
-    nUI=qjobs.UI_usage()
-    print("There are {} UI jobs".format(nUI))
+    # nUI=qjobs.UI_usage()
+    # print("There are {} UI jobs".format(nUI))
+
+    for x,y in qjobs.servers.items():
+        print("{} queue has {} jobs".format(x,y))
+        
     print("{} jobs running; {} jobs submitted\n".format(
         qjobs.n_rjobs(),qjobs.n_jobs()))
 
@@ -543,29 +710,39 @@ def main(path):
         print(ss)
 
     print(character_frame('Summary'))
-    print("There are {} UI qjobs".format(nUI))
+    qjobs2=Qjob_list()
+    qjobs2.myq_without_folder()
+    qjobs2.update_servers()
+    # print("There are {} UI qjobs".format(nUI))
+    for x,y in qjobs.servers.items():
+        print("{} queue has {} jobs".format(x,y))
     print("{} qjobs running; {} qjobs submitted".format(
-        qjobs.n_rjobs(),qjobs.n_jobs()))
+        qjobs2.n_rjobs(),qjobs2.n_jobs()))
     print(fjobs.summary())
 
 ############################
 # run main function
 ##############################
-class common:
-    path='./'
+if __name__=='__main__':
 
-def my_job():
-    oldstdout = sys.stdout
-    sys.stdout = open('currentjob.txt', 'w+')
-    main(common.path)
-    sys.stdout.flush()
-    sys.stdout=oldstdout
+    class common:
+        path='./'
 
-common.path=os.getcwd()
-scheduler = BlockingScheduler()
-scheduler.add_job(my_job, 'interval', minutes=10,
-                  next_run_time=datetime.datetime.now())
-scheduler.start()
+    def my_job():
+        oldstdout = sys.stdout
+        sys.stdout = open('currentjob.txt', 'w+')
+        main(common.path)
+        sys.stdout.flush()
+        sys.stdout=oldstdout
+
+    common.path=os.getcwd()
+    scheduler = BlockingScheduler()
+    scheduler.add_job(my_job, 'interval', minutes=10,
+                      next_run_time=datetime.datetime.now())
+    scheduler.start()
+
+
+# main(common.path)
 
 
 
